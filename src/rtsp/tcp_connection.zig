@@ -21,7 +21,7 @@ pub const TcpConnection = struct {
 
         const writer = stream.writer(io, writer_buffer);
 
-        const reader_buffer = try allocator.alloc(u8, 10);
+        const reader_buffer = try allocator.alloc(u8, 65536);
         errdefer allocator.free(reader_buffer);
 
         const reader = stream.reader(io, reader_buffer);
@@ -39,11 +39,11 @@ pub const TcpConnection = struct {
         self.stream.close(io);
     }
 
-    pub inline fn gerWriter(self: *TcpConnection) std.Io.Writer {
-        return self.writer.interface;
+    pub inline fn getWriter(self: *TcpConnection) *std.Io.Writer {
+        return &self.writer.interface;
     }
 
-    pub inline fn getReader(self: *TcpConnection) std.Io.Reader {
-        return self.reader.interface;
+    pub inline fn getReader(self: *TcpConnection) *std.Io.Reader {
+        return &self.reader.interface;
     }
 };

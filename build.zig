@@ -87,4 +87,24 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
+
+    // Step chạy toàn bộ unit tests
+    const test_step = b.step("test", "Run unit tests");
+    const test_files = [_][]const u8{
+        "src/rtsp/parser.zig",
+        "src/rtsp/response.zig",
+        "src/rtsp/request.zig",
+        "src/rtsp/rtsp.zig",
+        "src/rtsp/rtp_response.zig",
+    };
+    for (test_files) |test_path| {
+        const unit_test = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(test_path),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        test_step.dependOn(&b.addRunArtifact(unit_test).step);
+    }
 }

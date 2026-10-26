@@ -66,6 +66,8 @@ pub const Request = struct {
     cseq: u32 = 1,
     /// Bảng lưu các trường tiêu đề (RFC 2326 Mục 4.2, Mục 5, Mục 6.2, Mục 8.1).
     header_fields: std.hash_map.StringHashMapUnmanaged([]const u8) = .empty,
+    /// Nội dung phần thân của thông điệp yêu cầu (RFC 2326 Mục 6).
+    body: ?[]const u8 = null,
 
     /// Khởi tạo một đối tượng yêu cầu RTSP với URI và phiên bản giao thức chỉ định (RFC 2326 Mục 3.1, 3.2, 6.1).
     pub fn init(allocator: std.mem.Allocator, uri: []const u8, version: []const u8) !Request {
@@ -100,8 +102,15 @@ pub const Request = struct {
     /// Làm mới request để chuẩn bị cho lệnh tiếp theo: xóa headers, reset bộ nhớ arena, và tăng CSeq (RFC 2326 Mục 12.17).
     pub fn reset(self: *Request) void {
         self.header_fields = .empty;
+        self.body = null;
         _ = self.arena_allocator.reset(.retain_capacity);
         self.cseq += 1;
+    }
+
+    /// Thiết lập nội dung phần thân thông điệp (RFC 2326 Mục 6).
+    pub fn setBody(self: *Request, body_data: []const u8) !void {
+        const local_body = try self.arena_allocator.allocator().dupe(u8, body_data);
+        self.body = local_body;
     }
 
     /// Cập nhật Request-URI (RFC 2326 Mục 3.2).
@@ -297,12 +306,13 @@ pub const Request = struct {
     }
 
     /// Tuần tự hóa toàn bộ thông điệp yêu cầu RTSP ra writer (RFC 2326 Mục 6).
+    /// Trả về số thứ tự sequence (CSeq) đã gửi để tiện theo dõi và đối chiếu với Response.
     /// Cấu trúc:
     ///   Request-Line CRLF
     ///   *(header-name ": " header-value CRLF)
     ///   "CSeq: " cseq CRLF
     ///   CRLF
-    pub fn writeAll(self: *const Request, writer: *std.Io.Writer) !void {
+    pub fn writeAll(self: *const Request, writer: *std.Io.Writer) !u32 {
         try self.request_line.writeAll(writer);
         try writer.writeAll("\r\n");
         var it = self.header_fields.iterator();
@@ -312,14 +322,49 @@ pub const Request = struct {
             try writer.writeAll(entry.value_ptr.*);
             try writer.writeAll("\r\n");
         }
+        if (self.body) |b| {
+            if (b.len > 0 and !self.hasHeaderField("Content-Length")) {
+                try writer.print("Content-Length: {d}\r\n", .{b.len});
+            }
+        }
         try self.writeCSeq(writer);
         try writer.writeAll("\r\n");
+        if (self.body) |b| {
+            if (b.len > 0) {
+                try writer.writeAll(b);
+            }
+        }
+        return self.cseq;
     }
 
     /// Ghi tiêu đề CSeq bắt buộc (RFC 2326 Mục 12.17).
     fn writeCSeq(self: *const Request, writer: *std.Io.Writer) !void {
         try writer.writeAll("CSeq: ");
         try writer.print("{d}\r\n", .{self.cseq});
+    }
+
+    /// In chi tiết yêu cầu RTSP ra console phục vụ debug
+    pub fn dump(self: *const Request) void {
+        std.debug.print("---------- [RTSP SEND REQUEST] ----------\n", .{});
+        std.debug.print("{s} {s} {s}\n", .{
+            self.request_line.method.toString(),
+            self.request_line.uri,
+            self.request_line.version,
+        });
+        var it = self.header_fields.iterator();
+        while (it.next()) |entry| {
+            std.debug.print("{s}: {s}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
+        }
+        std.debug.print("CSeq: {d}\n", .{self.cseq});
+        if (self.body) |b| {
+            if (b.len > 0) {
+                if (!self.hasHeaderField("Content-Length")) {
+                    std.debug.print("Content-Length: {d}\n", .{b.len});
+                }
+                std.debug.print("\n[Body: {d} bytes]\n{s}\n", .{ b.len, b });
+            }
+        }
+        std.debug.print("-----------------------------------------\n", .{});
     }
 };
 
@@ -333,7 +378,8 @@ test "Request formatting and serialization" {
 
     var buffer: [512]u8 = undefined;
     var w = std.Io.Writer.fixed(&buffer);
-    try req.writeAll(&w);
+    const sent_cseq = try req.writeAll(&w);
+    try testing.expectEqual(@as(u32, 1), sent_cseq);
 
     const expected = "DESCRIBE rtsp://10.10.10.119:554/live RTSP/1.0\r\nAccept: application/sdp\r\nCSeq: 1\r\n\r\n";
     try testing.expectEqualStrings(expected, w.buffered());
@@ -372,7 +418,8 @@ test "Request general headers" {
 
     var buffer: [512]u8 = undefined;
     var w = std.Io.Writer.fixed(&buffer);
-    try req.writeAll(&w);
+    const sent_cseq = try req.writeAll(&w);
+    try testing.expectEqual(@as(u32, 42), sent_cseq);
 
     const out = w.buffered();
     try testing.expect(std.mem.indexOf(u8, out, "CSeq: 42\r\n") != null);
@@ -431,7 +478,8 @@ test "Request request headers" {
 
     var buffer: [2048]u8 = undefined;
     var w = std.Io.Writer.fixed(&buffer);
-    try req.writeAll(&w);
+    const sent_cseq = try req.writeAll(&w);
+    try testing.expectEqual(@as(u32, 1), sent_cseq);
 
     const out = w.buffered();
     try testing.expect(std.mem.indexOf(u8, out, "Accept: application/sdp\r\n") != null);
@@ -439,5 +487,22 @@ test "Request request headers" {
     try testing.expect(std.mem.indexOf(u8, out, "Transport: RTP/AVP;unicast;client_port=8000-8001\r\n") != null);
 }
 
+test "Request with body serialization" {
+    const testing = std.testing;
+    var req = try Request.init(testing.allocator, "rtsp://10.10.10.119:554/live", "RTSP/1.0");
+    defer req.deinit();
 
+    req.setRequestMethod(.SET_PARAMETER);
+    try req.addHeaderField("Content-Type", "text/parameters");
+    try req.setBody("packets_received: 100\r\njitter: 5\r\n");
 
+    var buffer: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buffer);
+    const sent_cseq = try req.writeAll(&w);
+    try testing.expectEqual(@as(u32, 1), sent_cseq);
+
+    const out = w.buffered();
+    try testing.expect(std.mem.startsWith(u8, out, "SET_PARAMETER rtsp://10.10.10.119:554/live RTSP/1.0\r\n"));
+    try testing.expect(std.mem.indexOf(u8, out, "Content-Length: 34\r\n") != null);
+    try testing.expect(std.mem.endsWith(u8, out, "\r\npackets_received: 100\r\njitter: 5\r\n"));
+}
