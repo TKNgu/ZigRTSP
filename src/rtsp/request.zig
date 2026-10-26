@@ -1,4 +1,5 @@
 const std = @import("std");
+pub const auth = @import("auth.zig");
 
 /// Các phương thức RTSP được định nghĩa trong RFC 2326 Mục 10 (Method Definitions)
 /// và Bảng 2 (Table 2: Overview of RTSP methods).
@@ -217,8 +218,39 @@ pub const Request = struct {
 
     /// Authorization: Thông tin xác thực người dùng (RFC 2326 Mục 12.5)
     /// Ví dụ: "Basic YWRtaW46MTIzNDU2" hoặc chuỗi Digest auth
-    pub fn setAuthorization(self: *Request, auth: []const u8) !void {
-        try self.addHeaderField("Authorization", auth);
+    pub fn setAuthorization(self: *Request, auth_header: []const u8) !void {
+        try self.addHeaderField("Authorization", auth_header);
+    }
+
+    /// Đính kèm thông tin xác thực Basic (RFC 7617) vào tiêu đề Authorization
+    pub fn setBasicAuth(self: *Request, username: []const u8, password: []const u8) !void {
+        const auth_str = try auth.generateBasicAuth(self.arena_allocator.allocator(), username, password);
+        try self.setAuthorization(auth_str);
+    }
+
+    /// Đính kèm thông tin xác thực Digest (RFC 2617) vào tiêu đề Authorization
+    pub fn setDigestAuth(
+        self: *Request,
+        challenge: auth.AuthChallenge,
+        username: []const u8,
+        password: []const u8,
+        method: Method,
+        uri: []const u8,
+        nc: u32,
+    ) !void {
+        const auth_str = try auth.generateDigestAuth(self.arena_allocator.allocator(), .{
+            .username = username,
+            .password = password,
+            .realm = challenge.realm,
+            .nonce = challenge.nonce orelse "",
+            .uri = uri,
+            .method = @tagName(method),
+            .qop = challenge.qop,
+            .nc = nc,
+            .@"opaque" = challenge.@"opaque",
+            .algorithm = challenge.algorithm,
+        });
+        try self.setAuthorization(auth_str);
     }
 
     /// From: Địa chỉ email của người dùng điều khiển máy khách (RFC 2326 Mục 12.20)

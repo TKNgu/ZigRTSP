@@ -96,6 +96,7 @@ pub fn build(b: *std.Build) void {
         "src/rtsp/request.zig",
         "src/rtsp/rtsp.zig",
         "src/rtsp/rtp_response.zig",
+        "src/rtsp/auth.zig",
     };
     for (test_files) |test_path| {
         const unit_test = b.addTest(.{

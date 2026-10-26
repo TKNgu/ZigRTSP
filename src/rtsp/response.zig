@@ -1,4 +1,7 @@
 const std = @import("std");
+pub const auth = @import("auth.zig");
+pub const AuthType = auth.AuthType;
+pub const AuthChallenge = auth.AuthChallenge;
 
 /// Dòng trạng thái của thông điệp phản hồi RTSP (RFC 2326 Mục 7.1 Status-Line).
 /// Cú pháp: Status-Line = RTSP-Version SP Status-Code SP Reason-Phrase CRLF
@@ -241,6 +244,19 @@ pub const Response = struct {
     /// WWW-Authenticate: Thách thức xác thực người dùng nếu mã 401 (RFC 2326 Mục 12.44)
     pub fn getWwwAuthenticate(self: *const Response) ?[]const u8 {
         return self.getHeaderField("WWW-Authenticate");
+    }
+
+    /// Trích xuất và phân tích cấu trúc thách thức xác thực (Basic / Digest) từ WWW-Authenticate
+    pub fn getAuthChallenge(self: *const Response) ?AuthChallenge {
+        if (self.getWwwAuthenticate()) |hdr| {
+            return AuthChallenge.parse(hdr);
+        }
+        return null;
+    }
+
+    /// Kiểm tra phản hồi có phải là yêu cầu xác thực người dùng (401 Unauthorized) hay không
+    pub fn isUnauthorized(self: *const Response) bool {
+        return self.status_line.status_code == 401;
     }
 
     // =========================================================================
@@ -556,4 +572,25 @@ test "Response streaming 1-byte at a time" {
     try testing.expectEqual(@as(u32, 5), resp.getCSeq());
     try testing.expectEqual(@as(usize, 4), resp.content_length);
     try testing.expectEqualStrings("TEST", resp.getBody());
+}
+
+test "Response 401 Unauthorized and getAuthChallenge" {
+    const testing = std.testing;
+    var resp = Response.init(testing.allocator);
+    defer resp.deinit();
+
+    var parser = Parser(Response).init(&resp);
+    const raw_401 = "RTSP/1.0 401 Unauthorized\r\nCSeq: 1\r\nWWW-Authenticate: Digest realm=\"IP Camera\", nonce=\"4a3c2b1d0e\", qop=\"auth\"\r\n\r\n";
+    try parser.parse(raw_401);
+
+    try testing.expect(resp.isUnauthorized());
+    try testing.expect(resp.getWwwAuthenticate() != null);
+
+    const challenge = resp.getAuthChallenge();
+    try testing.expect(challenge != null);
+    const ch = challenge.?;
+    try testing.expectEqual(AuthType.digest, ch.auth_type);
+    try testing.expectEqualStrings("IP Camera", ch.realm);
+    try testing.expectEqualStrings("4a3c2b1d0e", ch.nonce.?);
+    try testing.expectEqualStrings("auth", ch.qop.?);
 }

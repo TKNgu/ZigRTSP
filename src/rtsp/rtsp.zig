@@ -20,6 +20,11 @@ pub const RtpResponse = rtp.RTPResponser;
 pub const RtpHeader = rtp.RtpHeader;
 pub const IntlHeader = rtp.IntlHeader;
 
+pub const auth = @import("auth.zig");
+pub const AuthType = auth.AuthType;
+pub const AuthChallenge = auth.AuthChallenge;
+pub const Credentials = auth.Credentials;
+
 /// Các lỗi phát sinh phía máy khách RTSP
 pub const ClientError = error{
     /// Thao tác (PLAY, PAUSE, TEARDOWN, RECORD) yêu cầu Session ID nhưng chưa có
@@ -32,6 +37,8 @@ pub const RtspClient = struct {
         host: []const u8,
         port: u16,
         path: []const u8,
+        user: ?[]const u8 = null,
+        pass: ?[]const u8 = null,
     };
 
     /// Tùy chọn cho yêu cầu DESCRIBE (RFC 2326 Mục 10.2)
@@ -206,6 +213,10 @@ pub const RtspClient = struct {
     user_agent: ?[]const u8 = null,
     debug_enabled: bool = false,
 
+    credentials: ?Credentials = null,
+    auth_challenge: ?AuthChallenge = null,
+    auth_nc: u32 = 0,
+
     client_callback: *Callback,
     rtsp_parser: Parser(Callback),
     rtsp_response: *Response,
@@ -224,10 +235,11 @@ pub const RtspClient = struct {
         );
         errdefer tcp_connection.deinit(allocator, io);
 
+        const clean_path = std.mem.trimStart(u8, connection_info.path, "/");
         const uri = try std.fmt.allocPrint(
             allocator,
             "rtsp://{s}:{d}/{s}",
-            .{ connection_info.host, connection_info.port, connection_info.path },
+            .{ connection_info.host, connection_info.port, clean_path },
         );
         errdefer allocator.free(uri);
 
@@ -253,7 +265,7 @@ pub const RtspClient = struct {
 
         const rtsp_parser = Parser(Callback).init(client_callback);
 
-        return .{
+        var client: RtspClient = .{
             .allocator = allocator,
             .tcp_connection = tcp_connection,
             .rtsp_request = rtsp_request,
@@ -261,11 +273,22 @@ pub const RtspClient = struct {
             .session = null,
             .user_agent = null,
             .debug_enabled = false,
+            .credentials = null,
+            .auth_challenge = null,
+            .auth_nc = 0,
             .client_callback = client_callback,
             .rtsp_parser = rtsp_parser,
             .rtsp_response = rtsp_response,
             .rtp_response = rtp_response,
         };
+
+        if (connection_info.user) |u| {
+            if (connection_info.pass) |p| {
+                try client.setCredentials(u, p);
+            }
+        }
+
+        return client;
     }
 
     /// Giải phóng toàn bộ tài nguyên của RtspClient và đóng kết nối TCP
@@ -273,6 +296,10 @@ pub const RtspClient = struct {
         _ = allocator;
         if (self.session) |s| self.allocator.free(s);
         if (self.user_agent) |ua| self.allocator.free(ua);
+        if (self.credentials) |creds| {
+            self.allocator.free(creds.username);
+            self.allocator.free(creds.password);
+        }
         self.allocator.free(self.base_uri);
         self.rtsp_request.deinit();
         self.tcp_connection.deinit(self.allocator, io);
@@ -307,6 +334,38 @@ pub const RtspClient = struct {
             self.allocator.free(ua);
         }
         self.user_agent = try self.allocator.dupe(u8, user_agent);
+    }
+
+    /// Thiết lập tài khoản và mật khẩu cho phiên làm việc với RTSP Server
+    pub fn setCredentials(self: *RtspClient, username: []const u8, password: []const u8) !void {
+        if (self.credentials) |creds| {
+            self.allocator.free(creds.username);
+            self.allocator.free(creds.password);
+            self.credentials = null;
+        }
+        const u = try self.allocator.dupe(u8, username);
+        errdefer self.allocator.free(u);
+        const p = try self.allocator.dupe(u8, password);
+        self.credentials = .{
+            .username = u,
+            .password = p,
+        };
+    }
+
+    /// Thiết lập cấu trúc thách thức xác thực nhận được từ server (Basic hoặc Digest)
+    pub fn setAuthChallenge(self: *RtspClient, challenge: AuthChallenge) void {
+        self.auth_challenge = challenge;
+    }
+
+    /// Lấy thông tin thách thức xác thực hiện tại (nếu có)
+    pub fn getAuthChallenge(self: *const RtspClient) ?AuthChallenge {
+        return self.auth_challenge;
+    }
+
+    /// Lấy kiểu xác thực hiện tại (Basic hoặc Digest) nếu server đã yêu cầu xác thực
+    pub fn getAuthType(self: *const RtspClient) ?AuthType {
+        if (self.auth_challenge) |ch| return ch.auth_type;
+        return null;
     }
 
     /// Xây dựng URL đầy đủ cho một track cụ thể hoặc trả về base_uri
@@ -600,6 +659,13 @@ pub const RtspClient = struct {
                                     try self.setSession(sess_id);
                                 }
                             }
+
+                            // Tự động trích xuất và lưu thách thức xác thực nếu máy chủ trả về 401 Unauthorized
+                            if (resp.isUnauthorized()) {
+                                if (resp.getAuthChallenge()) |ch| {
+                                    self.auth_challenge = ch;
+                                }
+                            }
                         },
                         .rtp => {},
                     }
@@ -653,6 +719,26 @@ pub const RtspClient = struct {
         if (self.user_agent) |ua| {
             if (!self.rtsp_request.hasHeaderField("User-Agent")) {
                 try self.rtsp_request.setUserAgent(ua);
+            }
+        }
+
+        // Tự động sinh và đính kèm Authorization header nếu đã có credentials và auth_challenge
+        if (self.credentials) |creds| {
+            if (self.auth_challenge) |ch| {
+                if (!self.rtsp_request.hasHeaderField("Authorization")) {
+                    self.auth_nc += 1;
+                    const auth_str = try auth.generateAuthorization(
+                        self.allocator,
+                        ch,
+                        creds.username,
+                        creds.password,
+                        @tagName(self.rtsp_request.request_line.method),
+                        self.rtsp_request.request_line.uri,
+                        self.auth_nc,
+                    );
+                    defer self.allocator.free(auth_str);
+                    try self.rtsp_request.setAuthorization(auth_str);
+                }
             }
         }
 
@@ -718,4 +804,22 @@ test "Track resolution logic" {
     const track_null = try resolver.resolveTrackUri(null);
     defer testing.allocator.free(track_null);
     try testing.expectEqualStrings("rtsp://10.10.10.119:554/live", track_null);
+}
+
+test "AuthChallenge parse and type extraction" {
+    const testing = std.testing;
+
+    // Basic challenge
+    const basic_header = "Basic realm=\"Security Camera\"";
+    const basic_ch = AuthChallenge.parse(basic_header).?;
+    try testing.expectEqual(AuthType.basic, basic_ch.auth_type);
+    try testing.expectEqualStrings("Security Camera", basic_ch.realm);
+
+    // Digest challenge
+    const digest_header = "Digest realm=\"AXIS_WS\", nonce=\"0005a3b2\", qop=\"auth\"";
+    const digest_ch = AuthChallenge.parse(digest_header).?;
+    try testing.expectEqual(AuthType.digest, digest_ch.auth_type);
+    try testing.expectEqualStrings("AXIS_WS", digest_ch.realm);
+    try testing.expectEqualStrings("0005a3b2", digest_ch.nonce.?);
+    try testing.expectEqualStrings("auth", digest_ch.qop.?);
 }
